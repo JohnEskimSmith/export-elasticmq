@@ -1,0 +1,8 @@
+aiobotocore
+aiofiles
+aiohttp
+aiomisc
+geoip2
+PyYAML
+ujson
+uvloop

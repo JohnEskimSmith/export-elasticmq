@@ -1,0 +1,46 @@
+sqs:
+  service_name: sqs
+  endpoint_url: http://192.168.1.51:9324
+  region_name: elasticmq
+  aws_secret_access_key: x
+  aws_access_key_id: x
+  use_ssl: false
+  queue_owner_aws_account_id: 493287914427
+  endpoint: /mongo/digitalwave/dev.examples_json.tls.443
+  name: examples_json
+  mainuuid: 1bb71761-fcd2-4efd-846b-40dce08d9542
+  currentuuid: 811b5320-30bb-4639-aa97-922b67ed7eff
+port: 443
+geoip: true
+app_module_schema: keys/zgrab2_tls.keys
+app_module: tls
+size_bulk_mb: 4
+source: examples/source_task.json
+queue_sleep: 1
+try_retry_upload: 3
+senders: 4
+input:
+  file: /home/user/Wave/Digitalwave-ServiceUploader/examples/example_data.json
+# about load strings from results file, convert, create and filter
+converter: # how to convert lines from file to need struct
+  type: json # json or csv or python
+  module: null  # check_issuer
+  path: null  # path to python file
+  special: "," # for csv or for other using with for python(example)
+  function: null # name function from python file
+use_standart_filter: true
+timeout_filter: 5
+standart_filter:
+  path: data.tls.status
+  value_success: success
+use_custom_filter: false
+custom_filter:
+  module: null
+  path:   # path to python file of name module
+  function: null
+create_record:
+  type: default # json, default or python
+  default_fields: null
+  path: null
+  module: null
+  function: null
