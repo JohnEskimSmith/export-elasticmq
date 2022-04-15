@@ -37,11 +37,12 @@ def split_records(block_records: List[Dict], tags=None) -> List[Tuple[int, str]]
         return result
 
 
-async def send_one_message(client_q, message:str, queue_url: str) -> int:
+async def send_one_message(client_q, message:str, queue_url: str, logger) -> int:
     try:
         response = await client_q.send_message(QueueUrl=queue_url, MessageBody=message)
         status_sqs_aws = response['ResponseMetadata']['HTTPStatusCode']
-    except:
+    except Exception as e:
+        logger.error(e)
         status_sqs_aws = 0
     return status_sqs_aws
 

@@ -1,0 +1,52 @@
+sqs:
+  service_name: sqs
+  endpoint_url: https://192.168.1.51
+  region_name: elasticmq
+  aws_ca_bundle: 'cacert.pem'
+  client_crt: 'user_crt.txt'
+  client_key: 'user.key'
+  aws_secret_access_key: x
+  aws_access_key_id: x
+  use_ssl: true
+  queue_owner_aws_account_id: 493287914427
+  endpoint: /mongo/logsvpn/202203
+  name: 202203
+  mainuuid: 1bb71761-fcd2-4efd-846b-40dce08d9542
+  currentuuid: 811b5320-30bb-4639-aa97-922b67ed7egg
+port: 443
+geoip: false
+app_module_schema: keys/zgrab2_tls.keys
+app_module: tls
+size_bulk_mb: 4
+source: examples/source_task.json
+queue_sleep: 1
+try_retry_upload: 3
+senders: 4
+input:
+  file:
+    - /home/user/logs-vpn/20220327115426.json
+    - /home/user/logs-vpn/20220331235751.json
+    - /home/user/logs-vpn/20220331225451.json
+# about load strings from results file, convert, create and filter
+converter: # how to convert lines from file to need struct
+  type: json # json or csv or python
+  module: null  # check_issuer
+  path: null  # path to python file
+  special: "," # for csv or for other using with for python(example)
+  function: null # name function from python file
+use_standart_filter: false
+timeout_filter: 5
+standart_filter:
+  path: data.tls.status
+  value_success: success
+use_custom_filter: false
+custom_filter:
+  module: null
+  path:   # path to python file of name module
+  function: null
+create_record:
+  type: default # json, default or python
+  default_fields: null
+  path: null
+  module: null
+  function: null

@@ -13,13 +13,14 @@ from aiohttp import ClientSession, TraceConfig
 from .upload_utils import access_dot_path, return_dict_for_packed_record, return_value_from_dict_extended, check_iter
 from ujson import load as ujson_load, dumps as ujson_dumps, loads as ujson_loads
 import argparse
-from typing import Callable, Optional, Dict, List, Any, Tuple
+from typing import Callable, Optional, Dict, List, Any, Tuple, Union
 import geoip2.database
 from ipaddress import ip_address
 from datetime import datetime
 from yaml import (FullLoader as yaml_FullLoader,
                   load as yaml_load,
                   )
+from urllib.parse import urlparse, urlunparse
 from itertools import cycle
 from aiohttp import BasicAuth
 from pathlib import Path
@@ -290,7 +291,7 @@ class AppConfig:
     port: int
     queue_sleep: int
     operations: RecordOperation
-    input_file: str
+    input_file: Union[str, list]
     input_stdin: str
     collectors: dict
     sqs: dict
@@ -576,18 +577,34 @@ async def parse_settings_file(args: argparse.Namespace, logger) -> AppConfig:
             logger.error(f"Uploader client can't create or access to queue: {sqsname_queue}")
             exit(1)
         else:
+            if using_elasticmq:
+                real_schema = urlparse(init_keys['endpoint_url'])
+                url_schema = urlparse(queue_url)
+                queue_url = url_schema._replace(scheme=real_schema.scheme,
+                                                netloc=real_schema.netloc)
+                queue_url = urlunparse(queue_url)
             logger.info(f'Queue client created: {queue_url}')
         sqs['url'] = queue_url
         sqs['init_keys'] = init_keys
         sqs['client'] = client
         sqs['endpoint'] = _sqs['endpoint']
 
-    input_file = access_dot_path(config, 'input.file')
+    _input_files = []
+    _input_file = access_dot_path(config, 'input.file')
     input_stdin = access_dot_path(config, 'input.stdin')  # not implemented
-    if input_file:
-        if not Path(input_file).exists():
-            logger.error(f'errors: "input.file" - file not found: {input_file}')
-            exit(2)
+    if isinstance(_input_file, str):
+        _input_files = [_input_file]
+    elif isinstance(_input_file, list):
+        _input_files = _input_file
+    input_files = [f for f in _input_files]
+    for input_file in _input_files:
+        if input_file:
+            if not Path(input_file).exists():
+                logger.error(f'errors: "input.file" - file not found: {input_file}')
+                input_files.remove(input_file)
+    if len(input_files) == 0:
+        logger.error('all files not exists')
+        exit(2)
     try:
         filename_packing_dict = config['app_module_schema']
         packing_dict = return_dict_for_packed_record(filename_packing_dict, logger)
@@ -666,7 +683,7 @@ async def parse_settings_file(args: argparse.Namespace, logger) -> AppConfig:
         'mode_read_input': mode_read_input,
         'queue_sleep': queue_sleep,
         'operations': settings_for_records,
-        'input_file': '' if not input_file else input_file,
+        'input_file': '' if not input_files else input_files,
         'input_stdin': '' if not input_stdin else input_stdin,
         'collectors': collectors if collectors else {},  # TODO: спорный момент, обдумать
         'sqs': sqs if sqs else {},  # TODO: спорный момент, обдумать

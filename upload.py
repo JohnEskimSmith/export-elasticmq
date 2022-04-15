@@ -115,7 +115,8 @@ async def send_to_sqs(sem: asyncio.Semaphore,
                       message_and_size: Tuple,
                       config_sqs: Dict,
                       queue_statistics: asyncio.Queue,
-                      duration_parserecords: float):
+                      duration_parserecords: float,
+                      logger):
     start_time_of_send = time_monotonic()
 
     sqs_queue_url: str = config_sqs['url']
@@ -125,7 +126,7 @@ async def send_to_sqs(sem: asyncio.Semaphore,
     message = message_and_size[1]
     count_message = 1
     async with sem:
-        http_status = await send_one_message(client, message, sqs_queue_url)
+        http_status = await send_one_message(client, message, sqs_queue_url, logger)
 
     collector_host_name = 'SQS'
     duration_sendlogcollector = round(time_monotonic() - start_time_of_send, 4)
@@ -170,7 +171,8 @@ async def reader_file(config: AppConfig,
         logger.info(f'errors:{errors}')
         await queue_input.put(STOP_SIGNAL)
     else:
-        exit(1)
+        logger.error(f'{filename} - not found')
+        await queue_input.put(STOP_SIGNAL)
 
 
 async def reader_file_from_memory(config: AppConfig,
@@ -287,7 +289,8 @@ async def parse_records(config: AppConfig,
                                                              message,
                                                              config.sqs,
                                                              queue_statistics,
-                                                             duration_time_parserecords
+                                                             duration_time_parserecords,
+                                                             logger
                                                              )
                         task = asyncio.create_task(coroutine_logcollector)
                         await queue_tasks.put(task)
@@ -296,9 +299,26 @@ async def parse_records(config: AppConfig,
     await queue_tasks.put(STOP_SIGNAL)
 
 
+async def promise_to_close_clients(config: AppConfig, logger) -> None:
+    if config.collectors:
+        try:
+            for collector in config.collectors['list']:
+                await collector['session'].close()  # ClientSession from aiohttp
+        except Exception as e:
+            logger.error(e)
+            logger.error('errors when closing aiohttp ClientSessions connections')
+    elif config.sqs:
+        try:
+            await config.sqs['client'].close()
+        except Exception as e:
+            logger.error(e)
+            logger.error('errors when closing SQS Client connection')
+
+
 async def reader_statistics(config: AppConfig,
                             queue_statistics: asyncio.Queue,
-                            logger):
+                            logger,
+                            count_files=1):
     size_sum = 0
     count_sum = 0
     all_messages = 0
@@ -333,19 +353,9 @@ async def reader_statistics(config: AppConfig,
     logger.info(f'sent to Collectors(messages): {all_messages}')
     config.statistics['size'] = size_sum
     config.statistics['message'] = all_messages
-    if config.collectors:
-        try:
-            for collector in config.collectors['list']:
-                await collector['session'].close()  # ClientSession from aiohttp
-        except Exception as e:
-            logger.error(e)
-            logger.error('errors when closing aiohttp ClientSessions connections')
-    elif config.sqs:
-        try:
-            await config.sqs['client'].close()
-        except Exception as e:
-            logger.error(e)
-            logger.error('errors when closing SQS Client connection')
+    if count_files == 1:
+        await promise_to_close_clients(config, logger)
+
 
 
 async def executor_tasks(queue_tasks: asyncio.Queue,
@@ -359,10 +369,18 @@ async def executor_tasks(queue_tasks: asyncio.Queue,
     await queue_statistics.put(STOP_SIGNAL)
 
 
-async def main(config=None):
+async def main_upload_function(arguments_in=None, config_in=None):
     start_time = time_monotonic()
-    arguments = parse_args()
     # region simple Configure
+    # TODO: rethink
+    if not arguments_in:
+        arguments = parse_args()
+    else:
+        arguments = arguments_in
+    if not arguments:
+        print('not found arguments for upload...')
+        exit(1)
+
     basic_config(
         level=logging.INFO,
         buffered=True,
@@ -371,10 +389,15 @@ async def main(config=None):
     )
     logger = logging
     # endregion
-    if not config:
+
+    if not config_in:
         config: AppConfig = await parse_settings(arguments, logger)
+    else:
+        config = config_in
     if not config:
+        print('not found file: yaml with settings for upload...')
         exit(1)
+
     queue_input = asyncio.Queue()
     queue_task = asyncio.Queue()
     queue_statistics = asyncio.Queue()
@@ -382,56 +405,77 @@ async def main(config=None):
 
     start_time_about_file = time_monotonic()
 
-    input_file = config.input_file
-    if config.mode_read_input == 'memory':
-        # region read file to memory
-        input_file_end = Path(input_file).stat().st_size
-        try:
-            with open(input_file, 'rt', encoding='utf-8') as f:
-                raw_rows = [row[:-1] for row in f.readlines()]
-            blocks = grouper_generation(config.number_lines, raw_rows)
-        except:
+    input_files = []
+    _input_file = config.input_file
+    status_set_one_input_file = True
+    if isinstance(_input_file, str):
+        input_files = [_input_file]
+    elif isinstance(_input_file, list):
+        status_set_one_input_file= False
+        input_files = _input_file
+    count_files = len(input_files)
+    for input_file in input_files:
+        logger.info(f"{'*'*5}{input_file}{'*'*5}")
+        if config.mode_read_input == 'memory':
+            # region read file to memory
+            input_file_end = Path(input_file).stat().st_size
+            try:
+                with open(input_file, 'rt', encoding='utf-8') as f:
+                    raw_rows = [row[:-1] for row in f.readlines()]
+                blocks = grouper_generation(config.number_lines, raw_rows)
+            except:
+                exit(1)
+            duration_time_about_file = round(time_monotonic() - start_time_about_file, 4)
+            logger.info(f'File size: {round(input_file_end / 1024, 2)} '
+                        f'Kbytes. Time read file to memory: {duration_time_about_file}')
+            task_reader = reader_file_from_memory(config, queue_input, blocks, logger)
+            # endregion
+        elif config.mode_read_input == 'asyncio':
+            # region positions of chunk in file
+            input_file_end = Path(input_file).stat().st_size
+            default_size = config.size_bulk_mb * (1024 * 1024)
+            chunkify_positions = [(chunk_start, chunk_size)
+                                  for chunk_start, chunk_size in
+                                  chunkify(input_file, file_end=input_file_end, size=default_size)
+                                  ]
+            duration_time_about_file = round(time_monotonic() - start_time_about_file, 4)
+            logger.info(f'File size: {round(input_file_end/1024, 2)} '
+                        f'Kbytes. Time chunkify positions file: {duration_time_about_file}')
+            task_reader = reader_file(config, queue_input, chunkify_positions, logger)
+            # endregion
+        else:
+            logger.error('unknow type(mode) method read input file, exit.')
             exit(1)
-        duration_time_about_file = round(time_monotonic() - start_time_about_file, 4)
-        logger.info(f'File size: {round(input_file_end / 1024, 2)} '
-                    f'Kbytes. Time read file to memory: {duration_time_about_file}')
-        task_reader = reader_file_from_memory(config, queue_input, blocks, logger)
-        # endregion
-    elif config.mode_read_input == 'asyncio':
-        # region positions of chunk in file
-        input_file_end = Path(input_file).stat().st_size
-        default_size = config.size_bulk_mb * (1024 * 1024)
-        chunkify_positions = [(chunk_start, chunk_size)
-                              for chunk_start, chunk_size in
-                              chunkify(input_file, file_end=input_file_end, size=default_size)
-                              ]
-        duration_time_about_file = round(time_monotonic() - start_time_about_file, 4)
-        logger.info(f'File size: {round(input_file_end/1024, 2)} '
-                    f'Kbytes. Time chunkify positions file: {duration_time_about_file}')
-        task_reader = reader_file(config, queue_input, chunkify_positions, logger)
-        # endregion
-    else:
-        logger.error('unknow type(mode) method read input file, exit.')
-        exit(1)
 
-    task_parse = parse_records(config, queue_input, queue_task, queue_statistics, task_semaphore, logger)
-    task_execute = executor_tasks(queue_task, queue_statistics)
-    task_reader_statistics = reader_statistics(config, queue_statistics, logger)
+        task_parse = parse_records(config, queue_input, queue_task, queue_statistics, task_semaphore, logger)
+        task_execute = executor_tasks(queue_task, queue_statistics)
+        task_reader_statistics = reader_statistics(config, queue_statistics, logger, count_files=count_files)
 
-    running_tasks = [asyncio.create_task(worker)
-                     for worker in [task_reader, task_parse, task_execute, task_reader_statistics]]
-    await asyncio.wait(running_tasks)
+        running_tasks = [asyncio.create_task(worker)
+                         for worker in [task_reader, task_parse, task_execute, task_reader_statistics]]
+        await asyncio.wait(running_tasks)
 
-    config.statistics['duration'] = round(time_monotonic() - start_time, 4)
-    logger.info(f'summary duration: {config.statistics["duration"]}')
-    if config.statistics_file:
-        try:
-            with open(config.statistics_file, 'wt') as statistics_file:
-                ujson_dump(config.statistics, statistics_file)
-        except Exception as exp:
-            logger.error(f'save statistics: {str(exp)}')
+        config.statistics['duration'] = round(time_monotonic() - start_time, 4)
+        logger.info(f'summary duration: {config.statistics["duration"]}')
+        if config.statistics_file:
+            if count_files == 1:
+                try:
+                    with open(config.statistics_file, 'wt') as statistics_file:
+                        ujson_dump(config.statistics, statistics_file)
+                except Exception as exp:
+                    logger.error(f'save statistics: {str(exp)}')
+            else:
+                try:
+                    with open(config.statistics_file, 'at') as statistics_file:
+                        statistics_file.write(ujson_dumps(config.statistics)+'\n')
+                except Exception as e:
+                    logger.error(e)
+        start_time_about_file = time_monotonic()
+        start_time = time_monotonic()
+    if count_files > 1:
+        await promise_to_close_clients(config, logger)
 
 if __name__ == "__main__":
     # TODO: add read from stdin?
     uvloop.install()
-    asyncio.run(main())
+    asyncio.run(main_upload_function())
