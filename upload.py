@@ -266,6 +266,7 @@ async def parse_records(config: AppConfig,
                 duration_time_parserecords: float = round(time_monotonic() - start_time_parserecords, 4)
             if ready_records:
                 config.statistics['valid_records'] += len(ready_records)
+                coroutine_logcollector = None
                 if config.collectors:
                     collector = next(config.collectors['cycle'])  # ClientSession from aiohttp
                     coroutine_logcollector = send_to_logcollector(sem,
@@ -275,8 +276,6 @@ async def parse_records(config: AppConfig,
                                                                   queue_statistics,
                                                                   duration_time_parserecords,
                                                                   logger)
-                    task = asyncio.create_task(coroutine_logcollector)
-                    await queue_tasks.put(task)
                 elif config.sqs:
                     # из-за Яндекса: отсутствия в Яндексе тэгов для очередей,
                     # приходится писать информацию о сохранении внутрь блока с сообщением
@@ -290,12 +289,12 @@ async def parse_records(config: AppConfig,
                                                              config.sqs,
                                                              queue_statistics,
                                                              duration_time_parserecords,
-                                                             logger
-                                                             )
-                        task = asyncio.create_task(coroutine_logcollector)
-                        await queue_tasks.put(task)
+                                                             logger)
                 else:
                     pass
+                if coroutine_logcollector:
+                    task = asyncio.create_task(coroutine_logcollector)
+                    await queue_tasks.put(task)
     await queue_tasks.put(STOP_SIGNAL)
 
 
@@ -414,11 +413,12 @@ async def main_upload_function(arguments_in=None, config_in=None):
         status_set_one_input_file= False
         input_files = _input_file
     count_files = len(input_files)
-    for input_file in input_files:
-        logger.info(f"{'*'*5}{input_file}{'*'*5}")
+    for index_file, input_file in enumerate(input_files):
+        input_file_end = Path(input_file).stat().st_size
+        input_file_size_kb = round(input_file_end/1024, 2)
+        logger.info(f"{index_file+1}. {input_file} size: {input_file_size_kb} Kbytes")
         if config.mode_read_input == 'memory':
             # region read file to memory
-            input_file_end = Path(input_file).stat().st_size
             try:
                 with open(input_file, 'rt', encoding='utf-8') as f:
                     raw_rows = [row[:-1] for row in f.readlines()]
@@ -432,14 +432,13 @@ async def main_upload_function(arguments_in=None, config_in=None):
             # endregion
         elif config.mode_read_input == 'asyncio':
             # region positions of chunk in file
-            input_file_end = Path(input_file).stat().st_size
             default_size = config.size_bulk_mb * (1024 * 1024)
             chunkify_positions = [(chunk_start, chunk_size)
                                   for chunk_start, chunk_size in
                                   chunkify(input_file, file_end=input_file_end, size=default_size)
                                   ]
             duration_time_about_file = round(time_monotonic() - start_time_about_file, 4)
-            logger.info(f'File size: {round(input_file_end/1024, 2)} '
+            logger.info(f'File size: {input_file_size_kb} '
                         f'Kbytes. Time chunkify positions file: {duration_time_about_file}')
             task_reader = reader_file(config, queue_input, chunkify_positions, logger)
             # endregion
