@@ -7,7 +7,6 @@ __status__ = "Dev"
 
 __all__ = ["parse_args", "parse_settings", "AppConfig", "RecordOperation", "create_default_tags_for_routes_messages"]
 from base64 import standard_b64encode
-import aiobotocore
 from dataclasses import dataclass
 from random import shuffle
 from aiohttp import ClientSession, TraceConfig
@@ -25,14 +24,14 @@ from itertools import cycle
 from aiohttp import BasicAuth
 from pathlib import Path
 import sys
-from os import path as os_path, access as os_access, R_OK, sep
+from os import path as os_path, access as os_access, R_OK, sep, environ
 import importlib
 from asyncio import get_event_loop
 from inspect import iscoroutinefunction as inspect_iscoroutinefunction
 from .upload_sqs import return_queue_url_realtime
 from contextlib import AsyncExitStack
 from aiobotocore.session import AioSession
-
+from aiobotocore.config import AioConfig
 
 CONST_PATH_TO_MODULES = '/multimodules'
 CONST_PATH_TO_CONVERTERS = 'converters'
@@ -313,7 +312,7 @@ def load_config(path):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Upload data to Logcollector(asyncio)')
+    parser = argparse.ArgumentParser(description='Upload data to ElasticMQ(SQS)')
 
     parser.add_argument('-settings',
                         type=str,
@@ -414,10 +413,12 @@ async def check_collector(collector: Dict,
         pass
     return result
 
+
 async def create_sqs_client(session: AioSession, exit_stack: AsyncExitStack, auth_struct: Dict):
     # Create client and add cleanup
     client = await exit_stack.enter_async_context(session.create_client(**auth_struct))
     return client
+
 
 def create_default_tags_for_routes_messages(_sqs: Dict) -> Tuple[Dict, Dict]:
 
@@ -516,6 +517,7 @@ async def parse_settings_file(args: argparse.Namespace, logger) -> AppConfig:
             logger.error('errors with Collectors connections, exit.')
             exit(1)
     elif _sqs:
+        using_elasticmq = False
         # 1.
         # default tags:
         tags = {}
@@ -537,6 +539,14 @@ async def parse_settings_file(args: argparse.Namespace, logger) -> AppConfig:
                 _name_task = _tags['dest']['space']
             currentuuid = _sqs['currentuuid']
             sqsname_queue = f'Results_{_name_task}_cuuid_{currentuuid}'
+
+            if _sqs.get('region_name', '').lower() == 'elasticmq':
+                if 'https' in _sqs['endpoint_url'] and _sqs['use_ssl'] \
+                    and not (_sqs.get('aws_ca_bundle', False) and _sqs.get('client_crt', False) and _sqs.get('client_key', False)):
+                    logger.error(f'using elasticmq and SSL, but not seted some of crt, ca, key, exit')
+                    exit(1)
+                else:
+                    using_elasticmq = True
         else:
             if 'name_queue' not in _sqs:
                 sqsname_queue = 'TargetsDev'
@@ -546,24 +556,27 @@ async def parse_settings_file(args: argparse.Namespace, logger) -> AppConfig:
         keys = ['service_name', 'endpoint_url', 'region_name', 'aws_secret_access_key', 'aws_access_key_id', 'use_ssl']
         init_keys = dict().fromkeys(keys)
         for k in init_keys:
-            if k in keys:
+            if k in _sqs:
                 init_keys[k] = _sqs[k]
+        if using_elasticmq:
+            client_crt = _sqs['client_crt']
+            client_key = _sqs['client_key']
+            config_elasticmq = AioConfig(client_cert=(client_crt, client_key))
+            init_keys['config'] = config_elasticmq
+            if not environ.get('AWS_CA_BUNDLE'):
+                environ['AWS_CA_BUNDLE'] = _sqs['aws_ca_bundle']
 
         _session = AioSession()
         exit_stack = AsyncExitStack()
         client = await create_sqs_client(_session, exit_stack, auth_struct=init_keys)
 
-        # _session = aiobotocore.get_session()
-        # client = await _session._create_client(**init_keys)
-
-        # create_client - менеджер контекста, поэтому _create_client
-        logger.info('created Client for Queue')
+        logger.info(f'Trying to create a client for a queue: {sqsname_queue}')
         queue_url = await return_queue_url_realtime(client, sqsname_queue, logger, tags=tags, auto_create=True)
         if not queue_url:
             logger.error(f"Uploader client can't create or access to queue: {sqsname_queue}")
             exit(1)
         else:
-            logger.info(queue_url)
+            logger.info(f'Queue client created: {queue_url}')
         sqs['url'] = queue_url
         sqs['init_keys'] = init_keys
         sqs['client'] = client
@@ -650,7 +663,7 @@ async def parse_settings_file(args: argparse.Namespace, logger) -> AppConfig:
     app_settings = AppConfig(**{
         'senders': senders,
         'number_lines': number_lines,
-        'mode_read_input':mode_read_input,
+        'mode_read_input': mode_read_input,
         'queue_sleep': queue_sleep,
         'operations': settings_for_records,
         'input_file': '' if not input_file else input_file,

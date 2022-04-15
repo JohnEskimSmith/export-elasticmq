@@ -313,7 +313,7 @@ async def reader_statistics(config: AppConfig,
                 size_sum += size
                 count_sum += count_records
                 all_messages += number_of_messages
-                message_info = f"sent to Log collectors: sum. size:{size_sum}, " \
+                message_info = f"sent to log collectors: sum. size:{size_sum}, " \
                                f"sum. records:{count_sum}, current:{count_records}, " \
                                f"number of messages: {number_of_messages}, " \
                                f"parsing(duration): {duration_parserecords}, " \
@@ -359,7 +359,7 @@ async def executor_tasks(queue_tasks: asyncio.Queue,
     await queue_statistics.put(STOP_SIGNAL)
 
 
-async def main():
+async def main(config=None):
     start_time = time_monotonic()
     arguments = parse_args()
     # region simple Configure
@@ -371,9 +371,10 @@ async def main():
     )
     logger = logging
     # endregion
-
-    config: AppConfig = await parse_settings(arguments, logger)
-
+    if not config:
+        config: AppConfig = await parse_settings(arguments, logger)
+    if not config:
+        exit(1)
     queue_input = asyncio.Queue()
     queue_task = asyncio.Queue()
     queue_statistics = asyncio.Queue()
@@ -381,9 +382,9 @@ async def main():
 
     start_time_about_file = time_monotonic()
 
-    # region read file to memory
     input_file = config.input_file
     if config.mode_read_input == 'memory':
+        # region read file to memory
         input_file_end = Path(input_file).stat().st_size
         try:
             with open(input_file, 'rt', encoding='utf-8') as f:

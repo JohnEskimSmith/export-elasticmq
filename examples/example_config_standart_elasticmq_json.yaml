@@ -11,7 +11,7 @@ sqs:
   mainuuid: 1bb71761-fcd2-4efd-846b-40dce08d9542
   currentuuid: 811b5320-30bb-4639-aa97-922b67ed7eff
 port: 443
-geoip: true
+geoip: false
 app_module_schema: keys/zgrab2_tls.keys
 app_module: tls
 size_bulk_mb: 4
@@ -28,7 +28,7 @@ converter: # how to convert lines from file to need struct
   path: null  # path to python file
   special: "," # for csv or for other using with for python(example)
   function: null # name function from python file
-use_standart_filter: true
+use_standart_filter: false
 timeout_filter: 5
 standart_filter:
   path: data.tls.status
