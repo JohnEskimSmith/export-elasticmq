@@ -37,6 +37,7 @@ from aiobotocore.config import AioConfig
 CONST_PATH_TO_MODULES = '/multimodules'
 CONST_PATH_TO_CONVERTERS = 'converters'
 
+
 class RecordOperation:
 
     def __init__(self,
@@ -178,7 +179,8 @@ class RecordOperation:
                 pass
         return results
 
-    def simple_json(self, lines: List[str]) -> List[Dict]:
+    @staticmethod
+    def simple_json(lines: List[str]) -> List[Dict]:
         results = []
         for line in lines:
             try:
@@ -188,13 +190,6 @@ class RecordOperation:
         return results
 
     def save_default(self, record: Dict, port: int) -> Optional[Dict]:  # TODO rewrite with kwargs
-        """
-
-        :param json_input:
-        :param port:
-        :param logger:
-        :return:
-        """
 
         # TODO: rethink
         # region not good idea
@@ -236,16 +231,8 @@ class RecordOperation:
                 result.pop(k)
         return result
 
-
-    def save_json(self, record: Dict, port: int) -> Optional[Dict]:  # TODO rewrite with kwargs
-        """
-
-        :param json_input:
-        :param port:
-        :param logger:
-        :return:
-        """
-
+    @staticmethod
+    def save_json(record: Dict, port: int) -> Optional[Dict]:  # TODO rewrite with kwargs
         record_fields = ["port", "datetime"]
         try:
             port_for_record = int(port)
@@ -261,14 +248,7 @@ class RecordOperation:
                 result.pop(k)
         return result
 
-    def filter_default(self,
-                       record: Dict) -> bool:
-        """
-        проверка на 'success'==value_filter из файла настроек в записе (default)
-        :param record: record from standart parse
-        :param config: application config
-        :return:
-        """
+    def filter_default(self, record: Dict) -> bool:
         result = False
         try:
             value_record: Any = return_value_from_dict_extended(record, self.standart_filter_path)
@@ -279,7 +259,7 @@ class RecordOperation:
                 # result = any([value_filter == value for value in value_record])
                 result = value_filter in value_record
         except Exception as exp:
-            pass
+            self.logger.error(exp)
         return result
 
 
@@ -304,7 +284,6 @@ class AppConfig:
     statistics_file: str
     statistics: dict
     timeout_filter: int
-
 
 
 def load_config(path):
@@ -543,7 +522,9 @@ async def parse_settings_file(args: argparse.Namespace, logger) -> AppConfig:
 
             if _sqs.get('region_name', '').lower() == 'elasticmq':
                 if 'https' in _sqs['endpoint_url'] and _sqs['use_ssl'] \
-                    and not (_sqs.get('aws_ca_bundle', False) and _sqs.get('client_crt', False) and _sqs.get('client_key', False)):
+                    and not (_sqs.get('aws_ca_bundle', False) and
+                             _sqs.get('client_crt', False) and
+                             _sqs.get('client_key', False)):
                     logger.error(f'using elasticmq and SSL, but not seted some of crt, ca, key, exit')
                     exit(1)
                 else:

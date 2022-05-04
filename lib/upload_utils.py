@@ -8,14 +8,128 @@ __status__ = "Dev"
 __all__ = ["access_dot_path",
            "return_dict_for_packed_record",
            "return_value_from_dict_extended",
+           "gzip_prepare_records_bytes",
            "make_path",
            "check_iter",
-           "grouper_generation"]
+           "grouper_generation",
+           "STOP_SIGNAL",
+           "return_geoip",
+           "pack_record"]
 
-from typing import Any, Optional, Dict, Iterable, Iterator
+from typing import Any, Optional, Dict, Iterable, Iterator, List
 from ujson import load as ujson_load
 from pathlib import Path
 from itertools import zip_longest
+from ujson import dumps as ujson_dumps
+from gzip import compress as gzip_compress
+from zlib import compress as zlib_compress
+from ipaddress import ip_address
+
+
+STOP_SIGNAL = 'STOP'  # signal for stop to Queues chain
+
+
+def method_return_maxmind(ip_str: str,
+                          maxmind_reader_city,
+                          maxmind_reader_asn) -> Optional[Dict]:
+    result = {}
+    try:
+        # region asn
+        response_asn = maxmind_reader_asn.asn(ip_str)
+        asn = str(response_asn.autonomous_system_number)
+        aso = str(response_asn.autonomous_system_organization)
+        maxmind_asn_build_epoch = maxmind_reader_asn.metadata().build_epoch
+        update_dict = {"asn_info": {"asn": asn,
+                                    "aso": aso,
+                                    "build_epoch": maxmind_asn_build_epoch
+                                    }
+                       }
+        for k in list(update_dict.keys()):
+            if not update_dict[k]:
+                update_dict.pop(k)
+        result.update(update_dict)
+        # endregion
+    except:
+        pass
+    try:
+        # region city
+        response_city = maxmind_reader_city.city(ip_str)
+        city = response_city.city.name
+        country = response_city.country.name
+        maxmind_city_build_epoch = maxmind_reader_city.metadata().build_epoch
+        longitude, latitude = response_city.location.longitude, response_city.location.latitude
+        update_dict = {"city": city,
+                       "country": country,
+                       "location": {"type": "Point", "coordinates": [longitude, latitude]},
+                       "build_epoch": maxmind_city_build_epoch}
+        for k in list(update_dict.keys()):
+            if not update_dict[k]:
+                update_dict.pop(k)
+        result.update({"city_info": update_dict})
+        # endregion
+    except Exception as e:
+        pass
+    if result:
+        return {"geoip": result}
+
+
+def return_geoip(record: Dict, config: "AppConfig") -> Dict:
+    _ip = ''
+    field_geoip = {}
+    # TODO: rethink
+    if 'ipv4' in record:
+        _ip = record['ipv4']
+    elif 'ip_v4_int' in record:
+        try:
+            _ip = ip_address(record['ip_v4_int'])
+        except:
+            pass
+    elif 'ip' in record:
+        try:
+            _ip = ip_address(record['ip_v4_int'])
+        except:
+            pass
+    if _ip:
+        field_geoip: Optional[Dict] = method_return_maxmind(_ip,
+                                                            config.geoip['reader_city'],
+                                                            config.geoip['reader_asn'])
+    if field_geoip:
+        record.update(field_geoip)
+    return record
+
+
+
+
+def pack_record(record: dict,
+                keys: dict) -> dict:
+    if keys:
+        result = {}
+        for k, path_to_key in keys.items():
+            value = return_value_from_dict_extended(record, path_to_key)
+            if value:
+                need_path = k.split('.')
+                make_path(result, value, *need_path)
+        return result
+    else:
+        return record
+
+
+def zlib_prepare_records_bytes(records: List[Dict]) -> Optional[bytes]:
+    try:
+        data_json = bytes(ujson_dumps(records), encoding='utf-8')
+        data_packed = zlib_compress(data_json, 9)
+        return data_packed
+    except:
+        pass
+
+
+def gzip_prepare_records_bytes(records: List[Dict]) -> Optional[bytes]:
+    try:
+        data_json = bytes(ujson_dumps(records), encoding='utf-8')
+        data_packed = gzip_compress(data_json)
+        return data_packed
+    except:
+        pass
 
 
 def access_dot_path(dictionary: dict, path: str, value=None) -> Optional[Any]:

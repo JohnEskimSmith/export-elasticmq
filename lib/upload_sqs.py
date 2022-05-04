@@ -1,10 +1,13 @@
-import asyncio
-from typing import List, Optional, Dict, Iterator, Tuple
-from .upload_utils import grouper_generation
-from .upload_records import gzip_prepare_records_bytes
+from asyncio import Semaphore, Queue, create_task, gather
+from typing import List, Optional, Dict, Tuple
+from .upload_utils import grouper_generation, gzip_prepare_records_bytes
 from base64 import standard_b64encode
 from math import ceil as math_ceil
 from ujson import dumps as ujson_dumps
+from time import monotonic as time_monotonic
+
+__all__ = ["split_records", "send_to_sqs", "return_queue_url_realtime"]
+
 CONST_SQS_SIZE = 250*1024
 
 
@@ -27,9 +30,9 @@ def split_records(block_records: List[Dict], tags=None) -> List[Tuple[int, str]]
             updated_payload['data'] = _payload_base64.decode('utf-8')
             updated_payload = ujson_dumps(updated_payload)
             return [(size_payload_base64_bytes, updated_payload)]
-
-    else: #  больше лимита сообщения SQS
-        # grouping_factor - по сколько записей в "новых" блоках
+    else:
+        #  the size is more than the limit for SQS queues
+        #  grouping_factor - how many records in "new" blocks
         grouping_factor = len(block_records) // math_ceil(count)
         blocks = (split_records(block, tags) for block in grouper_generation(grouping_factor, block_records))
         for block in blocks:
@@ -37,7 +40,7 @@ def split_records(block_records: List[Dict], tags=None) -> List[Tuple[int, str]]
         return result
 
 
-async def send_one_message(client_q, message:str, queue_url: str, logger) -> int:
+async def send_one_message(client_q, message: str, queue_url: str, logger) -> int:
     try:
         response = await client_q.send_message(QueueUrl=queue_url, MessageBody=message)
         status_sqs_aws = response['ResponseMetadata']['HTTPStatusCode']
@@ -47,26 +50,55 @@ async def send_one_message(client_q, message:str, queue_url: str, logger) -> int
     return status_sqs_aws
 
 
-async def send_batch_to_queue(client_q, messages: List[str], queue_url: str) -> bool:
-    tasks = [asyncio.create_task(send_one_message(client_q, message, queue_url))
+async def send_to_sqs(sem: Semaphore,
+                      message_and_size: Tuple,
+                      config_sqs: Dict,
+                      queue_statistics: Queue,
+                      duration_parserecords: float,
+                      logger) -> None:
+    start_time_of_send = time_monotonic()
+
+    sqs_queue_url: str = config_sqs['url']
+    client = config_sqs['client']
+
+    size_payload = message_and_size[0]
+    message = message_and_size[1]
+    count_message = 1
+    async with sem:
+        http_status = await send_one_message(client, message, sqs_queue_url, logger)
+
+    collector_host_name = 'SQS'
+    duration_sendlogcollector = round(time_monotonic() - start_time_of_send, 4)
+
+    message = (count_message,
+               http_status,
+               count_message,
+               size_payload,
+               duration_parserecords,
+               duration_sendlogcollector,
+               collector_host_name
+               )
+    await queue_statistics.put(message)
+
+
+async def send_batch_to_queue(client_q, messages: List[str], queue_url: str, logger) -> bool:
+    tasks = [create_task(send_one_message(client_q, message, queue_url, logger))
              for message in messages]
-    responses = await asyncio.gather(*tasks)
-    #  все значения должны быть 200, http status из API SQS
+    responses = await gather(*tasks)
+    #  all values must be equal 200, http status from API SQS
     return all((value == 200 for value in responses))
 
 
-async def return_queue_url(client_q, queue_name: str, logger):
-    queue_url = None
+async def return_queue_url(client_q, queue_name: str, logger) -> Optional[str]:
     try:
         current_queue = await client_q.get_queue_url(QueueName=queue_name)
         queue_url = current_queue.get('QueueUrl')
-    except Exception as e:
-        logger.error(str(e))
-    if queue_url:
         return queue_url
+    except Exception as e:
+        logger.error(e)
 
 
-async def return_queue_url_realtime(client_q, queue_name, logger, tags={}, auto_create=False):
+async def return_queue_url_realtime(client_q, queue_name, logger, tags={}, auto_create=False) -> Optional[str]:
     queue_url = await return_queue_url(client_q, queue_name, logger)
     if queue_url:
         return queue_url

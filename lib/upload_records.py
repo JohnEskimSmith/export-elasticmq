@@ -5,185 +5,134 @@ __license__ = "GPLv3"
 __email__ = "andrew.foma@gmail.com"
 __status__ = "Dev"
 
-__all__ = ["zlib_prepare_records_bytes",
-           "gzip_prepare_records_bytes",
-           "parse_single_record_sync",
-           "parse_single_record_async"]
+__all__ = ["parse_records"]
 
-from typing import List, Dict, Optional, Callable, Any
+from typing import List, Dict, Optional, Tuple
 from ujson import dumps as ujson_dumps
-from gzip import compress as gzip_compress
-from zlib import compress as zlib_compress
-from ipaddress import ip_address
-from asyncio import wait_for as asyncio_wait_for
-from .upload_utils import (return_value_from_dict_extended, make_path, )
-from asyncio import TimeoutError as asyncio_TimeoutError
+from sys import getsizeof as sys_getsizeof
+from .upload_utils import (STOP_SIGNAL, gzip_prepare_records_bytes, )
+from .upload_settings import AppConfig
+from asyncio import Queue, Semaphore, create_task, sleep
+from time import monotonic as time_monotonic
+from .upload_sqs import split_records, send_to_sqs
+from .upload_parse_multi_records import parse_multi_records_sync, parse_multi_records_async
+from .upload_settings import create_default_tags_for_routes_messages
 
 
-def pack_record(record: dict,
-                keys: dict) -> dict:
-    if keys:
-        result = {}
-        for k, path_to_key in keys.items():
-            value = return_value_from_dict_extended(record, path_to_key)
-            if value:
-                need_path = k.split('.')
-                make_path(result, value, *need_path)
-        return result
-    else:
-        return record
-
-
-def gzip_prepare_records_bytes(records: List[Dict]) -> Optional[bytes]:
+async def send_to_logcollector(sem: Semaphore,
+                               block_records: List[dict],
+                               config: AppConfig,
+                               collector: dict,
+                               queue_statistics: Queue,
+                               duration_parserecords: float,
+                               logger) -> None:
+    trace_request_ctx = {'request': True}
+    url: str = collector['url']
+    collector_host_name: str = collector['name']
+    client_session = collector['session']  # ClientSession from aiohttp
+    use_gzip: bool = collector.get('use_gzip', False)
+    http_status = 1000  # for example, http_status, payload - need rethink?
+    payload = b''
+    if use_gzip:
+        payload: Optional[bytes] = gzip_prepare_records_bytes(block_records)
+    async with sem:
+        if (payload and use_gzip) or (block_records and not use_gzip):
+            http_status = 0
+            try:
+                attempts: int = config.try_retry_upload
+                sleep_time = 1
+                while True and attempts > 0:
+                    if use_gzip and payload:
+                        async with client_session.post(url,
+                                                       data=payload,
+                                                       trace_request_ctx=trace_request_ctx) as response:
+                            http_status = response.status
+                    elif block_records and not use_gzip:
+                        async with client_session.post(url,
+                                                       json=block_records,
+                                                       trace_request_ctx=trace_request_ctx) as response:
+                            http_status = response.status
+                    if http_status == 200:
+                        break
+                    else:
+                        logger.error(f"Log-collector: http status: {http_status}")
+                        attempts -= 1
+                        await sleep(sleep_time)
+            except Exception as exc:
+                logger.error(exc)
     try:
-        data_json = bytes(ujson_dumps(records), encoding='utf-8')
-        data_packed = gzip_compress(data_json)
-        return data_packed
-    except:
-        pass
+        duration_sendlogcollector = trace_request_ctx['duration']
+    except Exception as exp:
+        logger.error(exp)
+        duration_sendlogcollector = 0
+    size_payload = len(payload)
+    if not payload and not use_gzip:
+        size_payload = sys_getsizeof(ujson_dumps(block_records))
+
+    message = (1,
+               http_status,
+               len(block_records),
+               size_payload,
+               duration_parserecords,
+               duration_sendlogcollector,
+               collector_host_name
+               )
+    await queue_statistics.put(message)
 
 
-def zlib_prepare_records_bytes(records: List[Dict]) -> Optional[bytes]:
-    try:
-        data_json = bytes(ujson_dumps(records), encoding='utf-8')
-        data_packed = zlib_compress(data_json, 9)
-        return data_packed
-    except:
-        pass
+async def parse_records(config: AppConfig,
+                        queue_input: Queue,
+                        queue_tasks: Queue,
+                        queue_statistics: Queue,
+                        sem: Semaphore,
+                        logger) -> None:
 
-def method_return_maxmind(ip_str: str,
-                          maxmind_reader_city,
-                          maxmind_reader_asn) -> Optional[Dict]:
-    result = {}
-    try:
-        # region asn
-        response_asn = maxmind_reader_asn.asn(ip_str)
-        asn = str(response_asn.autonomous_system_number)
-        aso = str(response_asn.autonomous_system_organization)
-        maxmind_asn_build_epoch = maxmind_reader_asn.metadata().build_epoch
-        update_dict = {"asn_info": {"asn": asn,
-                                    "aso": aso,
-                                    "build_epoch": maxmind_asn_build_epoch
-                                    }
-                       }
-        for k in list(update_dict.keys()):
-            if not update_dict[k]:
-                update_dict.pop(k)
-        result.update(update_dict)
-        # endregion
-    except:
-        pass
-    try:
-        # region city
-        response_city = maxmind_reader_city.city(ip_str)
-        city = response_city.city.name
-        country = response_city.country.name
-        maxmind_city_build_epoch = maxmind_reader_city.metadata().build_epoch
-        longitude, latitude = response_city.location.longitude, response_city.location.latitude
-        update_dict = {"city": city,
-                       "country": country,
-                       "location": {"type": "Point", "coordinates": [longitude, latitude]},
-                       "build_epoch": maxmind_city_build_epoch}
-        for k in list(update_dict.keys()):
-            if not update_dict[k]:
-                update_dict.pop(k)
-        result.update({"city_info": update_dict})
-        # endregion
-    except Exception as e:
-        pass
-    if result:
-        return {"geoip": result}
-
-
-def return_geoip(record: Dict, config: "AppConfig") -> Dict:
-    _ip = ''
-    field_geoip = {}
-    # TODO: rethink
-    if 'ipv4' in record:
-        _ip = record['ipv4']
-    elif 'ip_v4_int' in record:
-        try:
-            _ip = ip_address(record['ip_v4_int'])
-        except:
-            pass
-    elif 'ip' in record:
-        try:
-            _ip = ip_address(record['ip_v4_int'])
-        except:
-            pass
-    if _ip:
-        field_geoip: Optional[Dict] = method_return_maxmind(_ip,
-                                                            config.geoip['reader_city'],
-                                                            config.geoip['reader_asn'])
-    if field_geoip:
-        record.update(field_geoip)
-    return record
-
-
-def parse_single_record_sync(record: Dict,
-                        config: "AppConfig",
-                        save_function: Callable,
-                        current_filter_record: Callable,
-                        source_worker: Dict,
-                        logger) -> Optional[Dict]:
-
-    ready_record = None
-    if config.operations.unfiltred:
-        ready_record = record
-    else:  # в противном случае срабатывает стандартный фильтр
-        try:
-            check_result_after_filter: Any = current_filter_record(record=record)
-        except Exception as exp:
-            ready_record = record  # as mode config.operations.unfiltred == True
-            logger.error(exp)
+    while True:
+        records = await queue_input.get()
+        if records == STOP_SIGNAL:
+            break
         else:
-            if check_result_after_filter:
-                ready_record = record
-    if not ready_record:
-        return None
-    packing_dict: Dict = config.packing_dict
-    # TODO: other default function
-    default_record: Optional[Dict] = save_function(record=ready_record, port=config.port)
-    if default_record:
-        if config.geoip:
-            default_record: Dict = return_geoip(default_record, config)  # returned self default records or with geo
-        default_record.update(source_worker)
-        need_record: Dict = pack_record(default_record, packing_dict)
-        if need_record:
-            return need_record
+            # не лучшее решение, надо обдумать, но для проверки и как рабочая версия - норм
+            # проверяем асинхронная ли функция фильтра или нет
+            if not config.operations.async_filter:
+                start_time_parserecords = time_monotonic()
+                ready_records: List[Dict] = parse_multi_records_sync(records, config, logger)
+                duration_time_parserecords: float = round(time_monotonic() - start_time_parserecords, 4)
+            else:
+                start_time_parserecords = time_monotonic()
+                ready_records: List[Dict] = await parse_multi_records_async(records, config, logger)
+                duration_time_parserecords: float = round(time_monotonic() - start_time_parserecords, 4)
+            if ready_records:
+                config.statistics['valid_records'] += len(ready_records)
+                if config.collectors:
+                    collector = next(config.collectors['cycle'])  # ClientSession from aiohttp
+                    coroutine_logcollector = send_to_logcollector(sem,
+                                                                  ready_records,
+                                                                  config,
+                                                                  collector,
+                                                                  queue_statistics,
+                                                                  duration_time_parserecords,
+                                                                  logger)
+                    task = create_task(coroutine_logcollector)
+                    await queue_tasks.put(task)
+                elif config.sqs:
+                    # из-за Яндекса: отсутствия в Яндексе тэгов для очередей,
+                    # приходится писать информацию о сохранении внутрь блока с сообщением
+                    tags = None
+                    if 'yandex' in config.sqs['init_keys']['endpoint_url']:
+                        _, tags = create_default_tags_for_routes_messages(config.sqs)
+                    blocks: List[Tuple[int, str]] = split_records(ready_records, tags)
+                    for message in blocks:
+                        coroutine_logcollector = send_to_sqs(sem,
+                                                             message,
+                                                             config.sqs,
+                                                             queue_statistics,
+                                                             duration_time_parserecords,
+                                                             logger)
+                        task = create_task(coroutine_logcollector)
+                        await queue_tasks.put(task)
 
+                else:
+                    pass
 
-async def parse_single_record_async(record: Dict,
-                        config: "AppConfig",
-                        save_function: Callable,
-                        current_filter_record: Callable,
-                        source_worker: Dict,
-                        logger) -> Optional[Dict]:
-
-    ready_record = None
-    if config.operations.unfiltred:
-        ready_record = record
-    else:  # в противном случае срабатывает стандартный фильтр
-        try:
-            _c: Callable = current_filter_record(record=record)
-            check_result_after_filter: Any = await asyncio_wait_for(_c, timeout=config.timeout_filter)
-        except asyncio_TimeoutError:
-            # ready_record = record  # as mode config.operations.unfiltred == True
-            logger.error('timeout: filter function')
-        except Exception as exp:
-            logger.error(exp)
-        else:
-            if check_result_after_filter:
-                ready_record = record
-    if not ready_record:
-        return None
-    packing_dict: Dict = config.packing_dict
-    # TODO: other default function
-    default_record: Optional[Dict] = save_function(record=ready_record, port=config.port)
-    if default_record:
-        if config.geoip:
-            default_record: Dict = return_geoip(default_record, config)  # returned self default records or with geo
-        default_record.update(source_worker)
-        need_record: Dict = pack_record(default_record, packing_dict)
-        if need_record:
-            return need_record
+    await queue_tasks.put(STOP_SIGNAL)
